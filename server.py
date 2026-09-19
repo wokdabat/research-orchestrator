@@ -1,38 +1,17 @@
-"""
-server.py — Research Orchestration MCP Server
-
-Exposes 6 tools to calling agents:
-  start_research   — create a job, kick off SCOPING
-  get_state        — poll current job state
-  inject_source    — caller feeds in extra content mid-GATHERING
-  get_conflicts    — return detected contradictions
-  get_synthesis    — return the final answer
-  ask_followup     — drill deeper; forks a child job
-
-Run with:
-  python server.py           (stdio transport, for Claude Desktop / Claude Code)
-  python server.py --http    (HTTP transport, for n8n or custom callers)
-
-Requires:
-  ANTHROPIC_API_KEY env var
-"""
-
 from __future__ import annotations
 import asyncio
 import os
 import sys
 from typing import Any
 
-# Load .env before anything else touches os.environ
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
-    pass  # dotenv optional — env vars can be set externally
+    pass
 
-import fastmcp
+import anthropic
 from fastmcp import FastMCP
-
 from agents import (
     conflict_agent,
     gap_agent,
@@ -42,15 +21,36 @@ from agents import (
 )
 from fetchers import search_and_fetch
 from models import Finding, Job, JobState
+from memory import (
+    preload_job_from_memory,
+    persist_job_to_memory,
+    get_memory_status,
+    get_active_hypotheses_for_topic,
+)
+from hypothesis import (
+    list_hypotheses,
+    approve_hypothesis as _approve_hypothesis,
+    reject_hypothesis as _reject_hypothesis,
+    add_user_hypothesis,
+    STATUS_PROPOSED,
+    STATUS_ACTIVE,
+)
 
-# ── In-memory job store (swap for Redis/SQLite for persistence) ──────────────
+# ── Clients + job store ───────────────────────────────────────────────────────
+
+MODEL = os.environ.get("RESEARCH_MCP_MODEL", "claude-sonnet-4-20250514")
+_client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
 _jobs: dict[str, Job] = {}
 
 mcp = FastMCP(
     name="research-orchestrator",
     instructions=(
-        "A stateful research engine. Call start_research to begin, "
-        "then poll get_state until DONE, then call get_synthesis for the answer. "
+        "A stateful research engine with persistent memory. "
+        "Call start_research to begin, poll get_state until DONE, "
+        "then call get_synthesis for the answer. "
+        "Use get_graph_summary to see accumulated knowledge. "
+        "Use get_hypotheses to see tracked beliefs and approve_hypothesis to activate them. "
+        "Use add_hypothesis to track your own hypotheses. "
         "Use inject_source mid-run to add your own content. "
         "Use ask_followup to drill deeper on any sub-question."
     ),
@@ -67,18 +67,22 @@ def _get_job(job_id: str) -> Job:
 
 
 async def _run_pipeline(job: Job) -> None:
-    """
-    Execute the full state machine pipeline for a job.
-    Runs in the background so the caller isn't blocked.
-    Each stage is a guarded transition — failures land in FAILED.
-    """
     try:
-        # ── SCOPING ──────────────────────────────────────────────────────────
+        # ── Pre-load prior knowledge ──────────────────────────────────────────
+        preload_summary = preload_job_from_memory(job)
+        job.memory_preload = preload_summary  # store for get_state
+
+        # ── SCOPING ───────────────────────────────────────────────────────────
+        # Include active hypotheses in scope context
+        active_hyps = get_active_hypotheses_for_topic(job.topic)
+        hyp_context = (
+            "\n".join(f"- {h['statement']}" for h in active_hyps)
+            if active_hyps else ""
+        )
         scope = await scope_agent(job.topic, job.depth)
         job.transition(JobState.GATHERING, scope=scope)
 
-        # ── GATHERING ────────────────────────────────────────────────────────
-        # In production: replace _mock_fetch with real web fetch + chunking
+        # ── GATHERING ─────────────────────────────────────────────────────────
         tasks = [
             _fetch_and_summarize(query, job)
             for query in scope.source_targets[: job.MAX_FINDINGS]
@@ -86,11 +90,11 @@ async def _run_pipeline(job: Job) -> None:
         await asyncio.gather(*tasks)
         job.transition(JobState.CONFLICTING)
 
-        # ── CONFLICTING ──────────────────────────────────────────────────────
+        # ── CONFLICTING ───────────────────────────────────────────────────────
         conflicts = await conflict_agent(job.findings)
         job.transition(JobState.SYNTHESIZING, conflicts=conflicts)
 
-        # ── SYNTHESIZING ─────────────────────────────────────────────────────
+        # ── SYNTHESIZING ──────────────────────────────────────────────────────
         synthesis, scores = await synthesis_agent(job.topic, job.findings, job.conflicts)
         gaps = await gap_agent(job.topic, job.scope.completion_criteria, job.findings)
         job.transition(
@@ -100,8 +104,11 @@ async def _run_pipeline(job: Job) -> None:
             open_questions=gaps,
         )
 
+        # ── PERSIST TO MEMORY ─────────────────────────────────────────────────
+        memory_result = await persist_job_to_memory(job, _client, MODEL)
+        job.memory_write = memory_result  # store for get_state / get_synthesis
+
     except Exception as exc:
-        # Any unhandled error fails the job gracefully
         try:
             job.transition(JobState.FAILED, error=str(exc))
         except ValueError:
@@ -110,15 +117,9 @@ async def _run_pipeline(job: Job) -> None:
 
 
 async def _fetch_and_summarize(query: str, job: Job) -> None:
-    """
-    Search the web for a query, fetch top results, summarize each into a Finding.
-    Skips results that are unusable or would exceed the job's token budget.
-    """
     if job.findings_at_capacity:
         return
-
     fetch_results = await search_and_fetch(query, max_results=3)
-
     for fr in fetch_results:
         if job.findings_at_capacity:
             break
@@ -133,11 +134,10 @@ async def _fetch_and_summarize(query: str, job: Job) -> None:
             if finding.token_count <= job.MAX_TOKENS_PER_FINDING:
                 job.add_finding(finding)
         except Exception:
-            # One bad source doesn't kill the whole gather phase
             continue
 
 
-# ── MCP Tools ─────────────────────────────────────────────────────────────────
+# ── Original 6 MCP Tools ──────────────────────────────────────────────────────
 
 @mcp.tool()
 async def start_research(topic: str, depth: int = 3) -> dict[str, Any]:
@@ -149,7 +149,7 @@ async def start_research(topic: str, depth: int = 3) -> dict[str, Any]:
         depth: How exhaustively to research (1=quick, 5=thorough). Default 3.
 
     Returns:
-        job_id to use in all subsequent calls, and initial state.
+        job_id, initial state, and any prior knowledge preloaded from memory.
     """
     if not topic.strip():
         raise ValueError("topic must not be empty.")
@@ -158,13 +158,11 @@ async def start_research(topic: str, depth: int = 3) -> dict[str, Any]:
 
     job = Job(topic=topic.strip(), depth=depth)
     _jobs[job.id] = job
-
-    # Fire pipeline in background — caller polls get_state
     asyncio.create_task(_run_pipeline(job))
 
     return {
-        "job_id": job.id,
-        "state": job.state.value,
+        "job_id":  job.id,
+        "state":   job.state.value,
         "message": "Research started. Poll get_state until DONE, then call get_synthesis.",
     }
 
@@ -178,17 +176,18 @@ async def get_state(job_id: str) -> dict[str, Any]:
         job_id: The ID returned by start_research.
 
     Returns:
-        Full job snapshot including state, findings count, and any error.
+        Full job snapshot including state, findings count, memory preload summary, and any error.
     """
     job = _get_job(job_id)
-    return job.to_dict()
+    d = job.to_dict()
+    d["memory_preload"] = getattr(job, "memory_preload", None)
+    return d
 
 
 @mcp.tool()
 async def inject_source(job_id: str, content: str, source_url: str = "injected") -> dict[str, Any]:
     """
     Inject external content into an active GATHERING job.
-    Use this to add content the server can't fetch itself (e.g. internal docs).
 
     Args:
         job_id:     The job to inject into.
@@ -224,7 +223,7 @@ async def get_conflicts(job_id: str) -> dict[str, Any]:
         job_id: The job ID.
 
     Returns:
-        List of conflict objects, each with both sides and confidence scores.
+        List of conflict objects with both sides and confidence scores.
     """
     job = _get_job(job_id)
     if job.state in (JobState.SCOPING, JobState.GATHERING):
@@ -232,13 +231,13 @@ async def get_conflicts(job_id: str) -> dict[str, Any]:
     return {
         "conflicts": [
             {
-                "claim_a": c.claim_a,
-                "source_a": c.source_a,
-                "claim_b": c.claim_b,
-                "source_b": c.source_b,
+                "claim_a":          c.claim_a,
+                "source_a":         c.source_a,
+                "claim_b":          c.claim_b,
+                "source_b":         c.source_b,
                 "characterization": c.characterization,
-                "confidence_a": c.confidence_a,
-                "confidence_b": c.confidence_b,
+                "confidence_a":     c.confidence_a,
+                "confidence_b":     c.confidence_b,
             }
             for c in job.conflicts
         ],
@@ -255,7 +254,7 @@ async def get_synthesis(job_id: str) -> dict[str, Any]:
         job_id: The job ID.
 
     Returns:
-        synthesis text, per-claim confidence scores, and open questions.
+        Synthesis text, confidence scores, open questions, and memory write summary.
     """
     job = _get_job(job_id)
     if job.state != JobState.DONE:
@@ -263,13 +262,17 @@ async def get_synthesis(job_id: str) -> dict[str, Any]:
             f"Synthesis not ready. Current state: {job.state.value}. "
             "Poll get_state until DONE."
         )
+    memory_write = getattr(job, "memory_write", {})
     return {
-        "synthesis":        job.synthesis,
-        "confidence_scores": job.confidence_scores,
-        "open_questions":   job.open_questions,
-        "findings_count":   len(job.findings),
-        "conflicts_count":  len(job.conflicts),
-        "total_tokens_used": job.total_tokens_used,
+        "synthesis":           job.synthesis,
+        "confidence_scores":   job.confidence_scores,
+        "open_questions":      job.open_questions,
+        "findings_count":      len(job.findings),
+        "conflicts_count":     len(job.conflicts),
+        "total_tokens_used":   job.total_tokens_used,
+        "hypotheses_proposed": memory_write.get("hypotheses_proposed", 0),
+        "hypotheses_affected": memory_write.get("hypotheses_affected", 0),
+        "proposed_hypotheses": memory_write.get("proposed_hypotheses", []),
     }
 
 
@@ -277,12 +280,12 @@ async def get_synthesis(job_id: str) -> dict[str, Any]:
 async def ask_followup(job_id: str, question: str, depth: int = 2) -> dict[str, Any]:
     """
     Drill deeper on a specific angle from a completed job.
-    Forks a new child job that inherits parent findings as pre-loaded context.
+    Forks a child job inheriting parent findings and memory context.
 
     Args:
         job_id:   The completed parent job to build on.
         question: The specific follow-up question.
-        depth:    Research depth for the child job (default 2, shallower).
+        depth:    Research depth for the child job (default 2).
 
     Returns:
         New child job_id to poll independently.
@@ -291,11 +294,9 @@ async def ask_followup(job_id: str, question: str, depth: int = 2) -> dict[str, 
     if parent.state != JobState.DONE:
         raise ValueError("Can only ask_followup on a DONE job.")
 
-    # Fork: child job starts with parent's synthesis as injected context
     child = Job(topic=question.strip(), depth=depth)
     _jobs[child.id] = child
 
-    # Pre-load parent findings into child so GATHERING is cheaper
     for f in parent.findings:
         if not child.findings_at_capacity:
             child.add_finding(f)
@@ -303,26 +304,98 @@ async def ask_followup(job_id: str, question: str, depth: int = 2) -> dict[str, 
     asyncio.create_task(_run_pipeline(child))
 
     return {
-        "child_job_id": child.id,
-        "parent_job_id": job_id,
-        "state": child.state.value,
+        "child_job_id":       child.id,
+        "parent_job_id":      job_id,
+        "state":              child.state.value,
         "inherited_findings": len(child.findings),
-        "message": f"Child job started with {len(child.findings)} inherited findings. Poll get_state(child_job_id).",
+        "message": f"Child job started with {len(child.findings)} inherited findings.",
     }
+
+
+# ── 4 New Memory + Hypothesis Tools ──────────────────────────────────────────
+
+@mcp.tool()
+async def get_graph_summary() -> dict[str, Any]:
+    """
+    Return a summary of the persistent knowledge graph and hypothesis status.
+
+    Shows accumulated knowledge across all research sessions:
+    node counts by type, top researched topics, contested claims,
+    and all hypotheses grouped by status.
+
+    Returns:
+        Graph statistics, top topics, and full hypothesis breakdown.
+    """
+    return get_memory_status()
+
+
+@mcp.tool()
+async def get_hypotheses(status: str = "") -> dict[str, Any]:
+    """
+    List tracked hypotheses, optionally filtered by status.
+
+    Args:
+        status: Filter by status — PROPOSED, ACTIVE, CONFIRMED, REFUTED, REJECTED.
+                Leave empty to return all hypotheses.
+
+    Returns:
+        List of hypothesis objects with confidence scores and evidence counts.
+    """
+    valid_statuses = {"PROPOSED", "ACTIVE", "CONFIRMED", "REFUTED", "REJECTED", ""}
+    if status.upper() not in valid_statuses:
+        raise ValueError(f"Invalid status '{status}'. Must be one of: {valid_statuses - {''}}")
+
+    hyps = list_hypotheses(status=status.upper() if status else None)
+    return {
+        "hypotheses": hyps,
+        "count":      len(hyps),
+        "filter":     status or "all",
+    }
+
+
+@mcp.tool()
+async def approve_hypothesis(hypothesis_id: str) -> dict[str, Any]:
+    """
+    Approve a PROPOSED hypothesis, moving it to ACTIVE status.
+
+    ACTIVE hypotheses are automatically evaluated against all future
+    research jobs on related topics. Confidence scores update as
+    supporting or contradicting evidence accumulates.
+
+    Args:
+        hypothesis_id: The hypothesis ID from get_hypotheses.
+
+    Returns:
+        Updated hypothesis with new status.
+    """
+    return _approve_hypothesis(hypothesis_id)
+
+
+@mcp.tool()
+async def add_hypothesis(statement: str, topic: str) -> dict[str, Any]:
+    """
+    Add your own hypothesis to track across future research sessions.
+
+    User-defined hypotheses start in ACTIVE status immediately —
+    no approval step required.
+
+    Args:
+        statement: A clear, falsifiable hypothesis statement.
+        topic:     The research topic this hypothesis relates to.
+
+    Returns:
+        New hypothesis object with ACTIVE status.
+    """
+    if not statement.strip():
+        raise ValueError("statement must not be empty.")
+    if not topic.strip():
+        raise ValueError("topic must not be empty.")
+    return add_user_hypothesis(statement.strip(), topic.strip())
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-def main() -> None:
-    """Entrypoint for both `uv run server.py` and the `research-mcp` script."""
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        print(
-            "Error: ANTHROPIC_API_KEY is not set.\n"
-            "Copy .env.example to .env and add your key, or set the env var directly.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
+if __name__ == "__main__":
     transport = "streamable-http" if "--http" in sys.argv else "stdio"
     port = int(os.environ.get("RESEARCH_MCP_PORT", "8000"))
 
@@ -331,7 +404,3 @@ def main() -> None:
         mcp.run(transport=transport, host="0.0.0.0", port=port)
     else:
         mcp.run(transport="stdio")
-
-
-if __name__ == "__main__":
-    main()
